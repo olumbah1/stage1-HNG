@@ -1,19 +1,22 @@
 from django.urls import path
 from .views import (
-    CreateAnalyzeString,
+    StringsCollection,
     GetSpecificString,
-    ListStrings,
-    DeleteString
-    )
+    DeleteString,
+    FilterByNaturalLanguage,
+)
 
 urlpatterns = [
+    # Combined collection endpoint (supports GET and POST)
+    path('strings', StringsCollection.as_view(), name='strings_no_slash'),
+    path('strings/', StringsCollection.as_view(), name='strings_with_slash'),
 
-    path('strings', CreateAnalyzeString.as_view(), name='create_string'),
+    # Natural language filter
+    path('strings/filter-by-natural-language', FilterByNaturalLanguage.as_view(), name='filter_by_nl'),
 
-    path('strings/', ListStrings.as_view(), name='list_strings'),
+    # IMPORTANT: place the DELETE route before the generic GET route so it is matched first.
+    path('strings/<path:string_value>/delete', DeleteString.as_view(), name='delete_string'),
 
-    path('strings/<str:string_value>', GetSpecificString.as_view(), name='get_string'),
-
-    path('strings/<str:string_value>/delete', DeleteString.as_view(), name='delete_string'),
-
+    # Get a specific string (must come after the delete route)
+    path('strings/<path:string_value>', GetSpecificString.as_view(), name='get_string'),
 ]

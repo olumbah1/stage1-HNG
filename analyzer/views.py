@@ -7,6 +7,8 @@ from .models import StringRecord
 from .serializers import StringRecordSerializer, AnalyzeRequestSerializer
 from .nl_parser import parse_nl_query
 import hashlib
+from django.utils import timezone
+from datetime import UTC
 import re
 
 
@@ -31,38 +33,43 @@ def word_count(s: str) -> int:
 
 class CreateAnalyzeString(APIView):
     def post(self, request):
+        # Validate incoming body
         serializer = AnalyzeRequestSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        value = serializer.validated_data['value']
-
+        value = serializer.validated_data["value"]
         if not isinstance(value, str):
             return Response(
-                {'detail': 'Invalid data type for "value" (must be string)'},
+                {"detail": 'Invalid data type for "value" (must be string)'},
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY
             )
 
         record_id = sha256_hash(value)
-
         if StringRecord.objects.filter(id=record_id).exists():
-            return Response(
-                {'detail': 'String already exists in the system'},
-                status=status.HTTP_409_CONFLICT
-            )
+            return Response({"detail": "String already exists in the system"},
+                            status=status.HTTP_409_CONFLICT)
 
         props = {
-            'length': len(value),
-            'is_palindrome': is_palindrome(value),
-            'unique_characters': len(set(value)),
-            'word_count': word_count(value),
-            'sha256_hash': record_id,
-            'character_frequency_map': character_frequency_map(value),
+            "length": len(value),
+            "is_palindrome": is_palindrome(value),
+            "unique_characters": len(set(value)),
+            "word_count": word_count(value),
+            "sha256_hash": record_id,
+            "character_frequency_map": character_frequency_map(value),
         }
 
         rec = StringRecord.objects.create(id=record_id, value=value, properties=props)
-        out = StringRecordSerializer(rec)
-        return Response(out.data, status=status.HTTP_201_CREATED)
+        # Ensure created_at is ISO formatted
+        created_iso = rec.created_at.astimezone(UTC).isoformat()
+
+        response_body = {
+            "id": rec.id,
+            "value": rec.value,
+            "properties": props,
+            "created_at": created_iso
+        }
+        return Response(response_body, status=status.HTTP_201_CREATED)
 
 
 class GetSpecificString(APIView):
@@ -145,3 +152,54 @@ class ListStrings(APIView):
             'count': len(results),
             'filters_applied': filters_applied
         }, status=status.HTTP_200_OK)
+
+class FilterByNaturalLanguage(APIView):
+    def get(self, request):
+        query = request.query_params.get('query')
+        if not query:
+            return Response({'detail': 'query parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            interpreted = parse_nl_query(query)
+        except ValueError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        queryset = StringRecord.objects.all().order_by('-created_at')
+        results = []
+        for rec in queryset:
+            p = rec.properties
+            ok = True
+            if 'is_palindrome' in interpreted and p.get('is_palindrome') != interpreted.get('is_palindrome'):
+                ok = False
+            if 'min_length' in interpreted and p.get('length') < interpreted.get('min_length'):
+                ok = False
+            if 'max_length' in interpreted and p.get('length') > interpreted.get('max_length'):
+                ok = False
+            if 'word_count' in interpreted and p.get('word_count') != interpreted.get('word_count'):
+                ok = False
+            if 'contains_character' in interpreted and interpreted.get('contains_character') not in rec.value:
+                ok = False
+            if ok:
+                results.append(rec)
+
+        serializer = StringRecordSerializer(results, many=True)
+        return Response({
+            'data': serializer.data,
+            'count': len(serializer.data),
+            'interpreted_query': {'original': query, 'parsed_filters': interpreted}
+        }, status=status.HTTP_200_OK)
+
+
+class StringsCollection(APIView):
+    """
+    Combined collection endpoint that supports:
+      - POST /strings      -> create/analyze (delegates to CreateAnalyzeString.post)
+      - GET  /strings/     -> list/filter (delegates to ListStrings.get)
+
+    We delegate to the existing view classes so you don't have to duplicate logic.
+    """
+    def get(self, request, *args, **kwargs):
+        return ListStrings().get(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        return CreateAnalyzeString().post(request, *args, **kwargs)
