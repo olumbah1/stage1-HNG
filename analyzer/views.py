@@ -1,24 +1,28 @@
+# analyzer/views.py
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.shortcuts import get_object_or_404
-from django.db.models import Q
 from .models import StringRecord
 from .serializers import StringRecordSerializer, AnalyzeRequestSerializer
 from .nl_parser import parse_nl_query
 import hashlib
-from django.utils import timezone
-from datetime import UTC
 import re
+from datetime import UTC
 
+# -----------------------
+# Utility functions
+# -----------------------
 
 def sha256_hash(s: str) -> str:
     return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
+def normalize_alpha(s: str) -> str:
+    # used only if you want normalized behavior; keep simple here
+    return re.sub(r'[^A-Za-z0-9]', '', s).lower()
 
 def is_palindrome(s: str) -> bool:
     return s.lower() == s.lower()[::-1]
-
 
 def character_frequency_map(s: str) -> dict:
     freq = {}
@@ -26,19 +30,29 @@ def character_frequency_map(s: str) -> dict:
         freq[ch] = freq.get(ch, 0) + 1
     return freq
 
-
 def word_count(s: str) -> int:
     return len([w for w in re.split(r"\s+", s) if w != ""])
 
+# -----------------------
+# Views
+# -----------------------
 
 class CreateAnalyzeString(APIView):
+    """
+    POST /strings
+    Returns:
+      201 Created with body on success
+      409 Conflict if duplicate
+      400 Bad Request for missing/invalid JSON
+      422 Unprocessable Entity for wrong value type
+    """
     def post(self, request):
-        # Validate incoming body
         serializer = AnalyzeRequestSerializer(data=request.data)
         if not serializer.is_valid():
+            # missing "value" or invalid JSON structure
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        value = serializer.validated_data["value"]
+        value = serializer.validated_data.get("value")
         if not isinstance(value, str):
             return Response(
                 {"detail": 'Invalid data type for "value" (must be string)'},
@@ -60,9 +74,7 @@ class CreateAnalyzeString(APIView):
         }
 
         rec = StringRecord.objects.create(id=record_id, value=value, properties=props)
-        # Ensure created_at is ISO formatted
         created_iso = rec.created_at.astimezone(UTC).isoformat()
-
         response_body = {
             "id": rec.id,
             "value": rec.value,
@@ -73,28 +85,43 @@ class CreateAnalyzeString(APIView):
 
 
 class GetSpecificString(APIView):
+    """
+    GET /strings/{string_value}
+    """
     def get(self, request, string_value):
         record_id = sha256_hash(string_value)
         rec = get_object_or_404(StringRecord, id=record_id)
-        out = StringRecordSerializer(rec)
-        return Response(out.data)
+        response_body = {
+            "id": rec.id,
+            "value": rec.value,
+            "properties": rec.properties,
+            "created_at": rec.created_at.astimezone(UTC).isoformat()
+        }
+        return Response(response_body, status=status.HTTP_200_OK)
 
 
 class DeleteString(APIView):
+    """
+    DELETE /strings/{string_value}/delete
+    """
     def delete(self, request, string_value):
         record_id = sha256_hash(string_value)
         try:
             rec = StringRecord.objects.get(id=record_id)
         except StringRecord.DoesNotExist:
-            return Response(
-                {'detail': 'String does not exist in the system'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"detail": "String does not exist in the system"},
+                            status=status.HTTP_404_NOT_FOUND)
         rec.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ListStrings(APIView):
+    """
+    GET /strings
+    Supports query params:
+      is_palindrome, min_length, max_length, word_count, contains_character
+    Returns JSON in the spec shape.
+    """
     def get(self, request):
         is_palindrome_param = request.query_params.get('is_palindrome')
         min_length = request.query_params.get('min_length')
@@ -120,11 +147,9 @@ class ListStrings(APIView):
 
         queryset = StringRecord.objects.all().order_by('-created_at')
         results = []
-
         for rec in queryset:
             p = rec.properties
             ok = True
-
             if parsed_is_pal is not None and p.get('is_palindrome') != parsed_is_pal:
                 ok = False
             if min_length is not None and p.get('length') < int(min_length):
@@ -135,25 +160,38 @@ class ListStrings(APIView):
                 ok = False
             if contains_char is not None and contains_char not in rec.value:
                 ok = False
-
             if ok:
-                results.append(StringRecordSerializer(rec).data)
+                results.append({
+                    "id": rec.id,
+                    "value": rec.value,
+                    "properties": rec.properties,
+                    "created_at": rec.created_at.astimezone(UTC).isoformat()
+                })
 
-        filters_applied = {
-            'is_palindrome': parsed_is_pal,
-            'min_length': min_length,
-            'max_length': max_length,
-            'word_count': word_count_q,
-            'contains_character': contains_char
-        }
+        filters_applied = {}
+        if parsed_is_pal is not None:
+            filters_applied["is_palindrome"] = parsed_is_pal
+        if min_length is not None:
+            filters_applied["min_length"] = int(min_length)
+        if max_length is not None:
+            filters_applied["max_length"] = int(max_length)
+        if word_count_q is not None:
+            filters_applied["word_count"] = int(word_count_q)
+        if contains_char is not None:
+            filters_applied["contains_character"] = contains_char
 
         return Response({
-            'data': results,
-            'count': len(results),
-            'filters_applied': filters_applied
+            "data": results,
+            "count": len(results),
+            "filters_applied": filters_applied
         }, status=status.HTTP_200_OK)
 
+
 class FilterByNaturalLanguage(APIView):
+    """
+    GET /strings/filter-by-natural-language?query=...
+    Parses simple NL queries into filters and returns same shape as ListStrings plus interpreted_query
+    """
     def get(self, request):
         query = request.query_params.get('query')
         if not query:
@@ -180,24 +218,22 @@ class FilterByNaturalLanguage(APIView):
             if 'contains_character' in interpreted and interpreted.get('contains_character') not in rec.value:
                 ok = False
             if ok:
-                results.append(rec)
+                results.append({
+                    "id": rec.id,
+                    "value": rec.value,
+                    "properties": rec.properties,
+                    "created_at": rec.created_at.astimezone(UTC).isoformat()
+                })
 
-        serializer = StringRecordSerializer(results, many=True)
         return Response({
-            'data': serializer.data,
-            'count': len(serializer.data),
-            'interpreted_query': {'original': query, 'parsed_filters': interpreted}
+            "data": results,
+            "count": len(results),
+            "interpreted_query": {"original": query, "parsed_filters": interpreted}
         }, status=status.HTTP_200_OK)
 
 
+# Combined collection endpoint that supports both GET and POST
 class StringsCollection(APIView):
-    """
-    Combined collection endpoint that supports:
-      - POST /strings      -> create/analyze (delegates to CreateAnalyzeString.post)
-      - GET  /strings/     -> list/filter (delegates to ListStrings.get)
-
-    We delegate to the existing view classes so you don't have to duplicate logic.
-    """
     def get(self, request, *args, **kwargs):
         return ListStrings().get(request, *args, **kwargs)
 
